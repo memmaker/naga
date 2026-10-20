@@ -947,30 +947,9 @@ func (w *Writer) writeEntryPointInputStruct(epIdx int, ep *ir.EntryPoint, fn *ir
 	// self.namer.call(&format!("{fun_name}Input"))
 	structName := w.namer.call(epName + "Input")
 
-	if hasLocationInputs {
-		emitInputStruct(structName, func() {
-			for i, arg := range fn.Arguments {
-				if arg.Binding == nil {
-					continue
-				}
-				loc, ok := (*arg.Binding).(ir.LocationBinding)
-				if !ok {
-					continue
-				}
-				argName := w.getName(nameKey{kind: nameKeyFunctionArgument, handle1: uint32(epFuncHandle(epIdx)), handle2: uint32(i)})
-				argType := w.writeTypeName(arg.Type, StorageAccess(0))
-
-				attr := locationInputAttribute(loc, ep.Stage, w.typeScalarKind(arg.Type))
-				w.WriteLine("%s %s %s;", argType, argName, attr)
-			}
-		})
-
-		w.hasVaryings = true
-		return structName, true
-	}
-
 	// Collect ALL struct args without bindings (flattened struct inputs).
-	// Rust naga flattens location members from ALL struct args into a single input struct.
+	// Rust naga flattens location members from ALL struct args into a single input struct,
+	// together with the location-bound arguments themselves.
 	type structArgInfo struct {
 		argIdx int
 		st     ir.StructType
@@ -989,68 +968,92 @@ func (w *Writer) writeEntryPointInputStruct(epIdx int, ep *ir.EntryPoint, fn *ir
 		}
 	}
 
-	// Emit empty input struct for entry points with builtin-only arguments
-	// (matching Rust naga behavior), but only if no struct arg will emit it.
-	if hasAnyBindingInputs && len(structArgs) == 0 {
-		emitInputStruct(structName, func() {})
+	if !hasLocationInputs && len(structArgs) == 0 {
+		// Emit empty input struct for entry points with builtin-only arguments
+		// (matching Rust naga behavior).
+		if hasAnyBindingInputs {
+			emitInputStruct(structName, func() {})
+		}
+		return "", false
 	}
 
 	if len(structArgs) > 0 {
 		// Track first struct arg for reconstruction.
 		w.entryPointInputStructArg = structArgs[0].argIdx
+	}
 
-		// Register names for ALL struct args' members.
-		// Location members get their own namespace (varyings_namer) to avoid
-		// collisions with global names. Builtin members use the global namer.
-		hasLocations := false
-		varyingsNamer := newNamer()
+	// Location members get their own namespace (varyings_namer) to avoid collisions
+	// with global names; the location-bound arguments' names are taken in it first,
+	// so a member never shadows one. Builtin members use the global namer.
+	hasLocations := hasLocationInputs
+	varyingsNamer := newNamer()
+	for i, arg := range fn.Arguments {
+		if arg.Binding == nil {
+			continue
+		}
+		if _, ok := (*arg.Binding).(ir.LocationBinding); ok {
+			varyingsNamer.call(w.getName(nameKey{kind: nameKeyFunctionArgument, handle1: uint32(epFuncHandle(epIdx)), handle2: uint32(i)}))
+		}
+	}
+	for _, sa := range structArgs {
+		for memberIdx, member := range sa.st.Members {
+			key := nameKey{kind: nameKeyStructMember, handle1: uint32(sa.tyH), handle2: uint32(memberIdx)}
+			baseName := w.getName(key)
+
+			isLocation := false
+			if member.Binding != nil {
+				if _, ok := (*member.Binding).(ir.LocationBinding); ok {
+					isLocation = true
+					hasLocations = true
+				}
+			}
+
+			var freshName string
+			if isLocation {
+				freshName = varyingsNamer.call(baseName)
+			} else {
+				freshName = w.namer.call(baseName)
+			}
+			w.flattenedMemberNames[key] = freshName
+		}
+	}
+
+	// Emit input struct with the location-bound arguments and the location-bound
+	// members of ALL struct args.
+	emitInputStruct(structName, func() {
+		for i, arg := range fn.Arguments {
+			if arg.Binding == nil {
+				continue
+			}
+			loc, ok := (*arg.Binding).(ir.LocationBinding)
+			if !ok {
+				continue
+			}
+			argName := w.getName(nameKey{kind: nameKeyFunctionArgument, handle1: uint32(epFuncHandle(epIdx)), handle2: uint32(i)})
+			argType := w.writeTypeName(arg.Type, StorageAccess(0))
+			attr := locationInputAttribute(loc, ep.Stage, w.typeScalarKind(arg.Type))
+			w.WriteLine("%s %s %s;", argType, argName, attr)
+		}
 		for _, sa := range structArgs {
 			for memberIdx, member := range sa.st.Members {
+				if member.Binding == nil {
+					continue
+				}
+				loc, ok := (*member.Binding).(ir.LocationBinding)
+				if !ok {
+					continue // skip builtins — they become separate params
+				}
 				key := nameKey{kind: nameKeyStructMember, handle1: uint32(sa.tyH), handle2: uint32(memberIdx)}
-				baseName := w.getName(key)
-
-				isLocation := false
-				if member.Binding != nil {
-					if _, ok := (*member.Binding).(ir.LocationBinding); ok {
-						isLocation = true
-						hasLocations = true
-					}
-				}
-
-				var freshName string
-				if isLocation {
-					freshName = varyingsNamer.call(baseName)
-				} else {
-					freshName = w.namer.call(baseName)
-				}
-				w.flattenedMemberNames[key] = freshName
+				memberName := w.flattenedMemberNames[key]
+				memberType := w.writeTypeName(member.Type, StorageAccess(0))
+				attr := locationInputAttribute(loc, ep.Stage, w.typeScalarKind(member.Type))
+				w.WriteLine("%s %s %s;", memberType, memberName, attr)
 			}
 		}
+	})
 
-		// Emit input struct with location-bound members from ALL struct args.
-		emitInputStruct(structName, func() {
-			for _, sa := range structArgs {
-				for memberIdx, member := range sa.st.Members {
-					if member.Binding == nil {
-						continue
-					}
-					loc, ok := (*member.Binding).(ir.LocationBinding)
-					if !ok {
-						continue // skip builtins — they become separate params
-					}
-					key := nameKey{kind: nameKeyStructMember, handle1: uint32(sa.tyH), handle2: uint32(memberIdx)}
-					memberName := w.flattenedMemberNames[key]
-					memberType := w.writeTypeName(member.Type, StorageAccess(0))
-					attr := locationInputAttribute(loc, ep.Stage, w.typeScalarKind(member.Type))
-					w.WriteLine("%s %s %s;", memberType, memberName, attr)
-				}
-			}
-		})
-
-		w.hasVaryings = hasLocations
-		return structName, true
-	}
-	return "", false
+	w.hasVaryings = hasLocations
+	return structName, true
 }
 
 // writeEntryPointOutputStruct writes the output struct for an entry point.
